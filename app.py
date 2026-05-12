@@ -137,7 +137,50 @@ async def fetch_cnpj_async(cnpj: str, session: aiohttp.ClientSession, semaphore:
                 if attempt == 2: default["atividade"] = "API Indisponível/Timeout"
                 await asyncio.sleep(1)
         return default
+async def fetch_apollo_async(email: str, nome: str, empresa: str, api_key: str, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore) -> dict:
+    """Bate no endpoint do Apollo.io de forma assíncrona e extrai Cargo e LinkedIn."""
+    default = {"email": email, "cargo": "N/D", "linkedin": "N/D"}
+    if pd.isna(email) or not str(email).strip() or not api_key: return default
 
+    nome_str = str(nome).strip() if pd.notna(nome) else ""
+    partes = nome_str.split(" ", 1)
+    first_name = partes[0] if len(partes) > 0 else ""
+    last_name = partes[1] if len(partes) > 1 else ""
+
+    url = "https://api.apollo.io/v1/people/match"
+    payload = {
+        "api_key": api_key,
+        "email": str(email).strip(),
+        "first_name": first_name,
+        "last_name": last_name,
+        "organization_name": str(empresa).strip() if pd.notna(empresa) else ""
+    }
+
+    async with semaphore:
+        for attempt in range(3):
+            try:
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        person = data.get("person", {})
+                        if person:
+                            return {
+                                "email": email,
+                                "cargo": person.get("title") or "N/D",
+                                "linkedin": person.get("linkedin_url") or "N/D"
+                            }
+                        return default
+                    elif r.status == 429: # Rate Limit
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    elif r.status == 401:
+                        default["cargo"] = "Chave API Inválida"
+                        return default
+                    else: break
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                await asyncio.sleep(1)
+        return default
+        
 def normalizar_nomes(nome):
     if pd.isna(nome) or not isinstance(nome, str): return ""
     excecoes = ['de', 'da', 'do', 'das', 'dos', 'e']
@@ -258,15 +301,62 @@ def executar_pipeline_elite(df_base, col_id, col_nome, col_empresa, col_cnpj, co
             df.drop(columns=['__api_data'], inplace=True)
             stats["empresas_encontradas"] = len(df[df["CNAE da Empresa"] != "N/D"])
 
+# --- INÍCIO DA INTEGRAÇÃO APOLLO ---
+        df["Cargo (Apollo)"] = "N/D"
+        df["LinkedIn (Apollo)"] = "N/D"
+        
+        if config.get('buscar_cargo') and config.get('apollo_key') and col_email in df.columns:
+            # Agrupa e remove emails duplicados ou vazios para NÃO GASTAR CRÉDITOS DUAS VEZES
+            emails_unicos = df[[col_email, col_nome, col_empresa]].dropna(subset=[col_email]).drop_duplicates(subset=[col_email])
+            prog_bar_apollo = st.progress(0)
+            
+            async def processar_apollo():
+                # Concorrência mais baixa (5) para não disparar o alarme de segurança do Apollo
+                sem = asyncio.Semaphore(5) 
+                resultados = {}
+                async with aiohttp.ClientSession() as session:
+                    tarefas = []
+                    for _, row in emails_unicos.iterrows():
+                        tarefas.append(fetch_apollo_async(row[col_email], row[col_nome], row[col_empresa], config['apollo_key'], session, sem))
+                    
+                    chunk_size = 20
+                    for i in range(0, len(tarefas), chunk_size):
+                        lote = tarefas[i:i+chunk_size]
+                        resps = await asyncio.gather(*lote)
+                        for r in resps: resultados[r['email']] = r
+                        
+                        processados = min(i + chunk_size, len(tarefas))
+                        prog = processados / len(tarefas) if len(tarefas) > 0 else 1.0
+                        prog_bar_apollo.progress(prog)
+                        log_ph.markdown(f"👔 **Etapa 4:** Resgatando Cargos e LinkedIn via Apollo ({processados}/{len(tarefas)})...")
+                return resultados
+
+            # Reutiliza o loop assíncrono já aberto pela BrasilAPI
+            mapa_apollo = loop.run_until_complete(processar_apollo())
+            prog_bar_apollo.empty()
+            
+            df['__apollo_data'] = df[col_email].map(mapa_apollo)
+            df["Cargo (Apollo)"] = df['__apollo_data'].apply(lambda x: x['cargo'] if isinstance(x, dict) else "N/D")
+            df["LinkedIn (Apollo)"] = df['__apollo_data'].apply(lambda x: x['linkedin'] if isinstance(x, dict) else "N/D")
+            df.drop(columns=['__apollo_data'], inplace=True)
+            stats["cargos_apollo"] = len(df[df["Cargo (Apollo)"] != "N/D"])
+        # --- FIM DA INTEGRAÇÃO APOLLO ---
+        
         log_ph.markdown("✅ **Montando matriz estrita de exportação...**")
         status_container.update(label="Processamento Finalizado com Sucesso!", state="complete", expanded=False)
     
     colunas_saida = [
-        ("ID", col_id), ("Nome", col_nome), ("Empresa", col_empresa), ("Cargo", "Cargo"), 
+        ("ID", col_id), ("Nome", col_nome), ("Empresa", col_empresa), 
+        ("Cargo (Original)", "Cargo"), 
         ("Telefone", col_tel), ("Email", col_email), ("Tipo de E-mail (Categoria)", "Tipo de E-mail"),
         ("CNPJ da Empresa", col_cnpj), ("Descrição da Atividade da Empresa", "Descrição da Atividade da Empresa"),
         ("CNAE da Empresa", "CNAE da Empresa"), ("Status de Email (Validação)", "Status de Email (Validação)")
     ]
+    
+    # Injeta as colunas do Apollo na tabela final apenas se a busca foi solicitada
+    if config.get('buscar_cargo'):
+        colunas_saida.insert(4, ("Cargo (Apollo)", "Cargo (Apollo)"))
+        colunas_saida.insert(5, ("LinkedIn (Apollo)", "LinkedIn (Apollo)"))
     
     df_out = pd.DataFrame()
     for col_saida, col_origem in colunas_saida:
@@ -412,11 +502,15 @@ if st.session_state.current_tab == aba_op:
             
             config = {}
             with st.expander("⚙️ Configurações Avançadas", expanded=False):
-                config["desduplicar"] = st.checkbox("🧹 Remover leads duplicados", True, help="Remove leads que possuem o mesmo E-mail ou CNPJ, mantendo apenas a primeira ocorrência.")
-                config["norm_nomes"] = st.checkbox("Aa Normalizar Nomes Próprios", True, help="Formata nomes despadronizados. Ex: 'JOAO DA SILVA' vira 'Joao da Silva'.")
-                config["padronizar_tel"] = st.checkbox("📞 Padronizar Telefones", True, help="Aplica formatação universal de DDI/DDD (XX) XXXXX-XXXX aos números.")
-                config["validar_email"] = st.checkbox("📧 Validação MX de E-mails", True, help="Faz um ping no servidor DNS para verificar se a caixa de e-mail está ativa ou morta.")
-                config["buscar_cnpj"] = st.checkbox("🏢 Enriquecimento BrasilAPI", True, help="Usa o CNPJ para buscar a Razão Social real e a Descrição da Atividade (CNAE) da empresa em tempo real.")
+                config["desduplicar"] = st.checkbox("🧹 Remover leads duplicados", True, help="Remove leads que possuem o mesmo E-mail ou CNPJ.")
+                config["norm_nomes"] = st.checkbox("Aa Normalizar Nomes Próprios", True)
+                config["padronizar_tel"] = st.checkbox("📞 Padronizar Telefones", True)
+                config["validar_email"] = st.checkbox("📧 Validação MX de E-mails", True)
+                config["buscar_cnpj"] = st.checkbox("🏢 Enriquecimento BrasilAPI", True)
+                
+                st.markdown("---")
+                config["buscar_cargo"] = st.checkbox("👔 Buscar Cargo e LinkedIn (Apollo.io)", False, help="Consome 1 crédito por lead analisado.")
+                config["apollo_key"] = st.text_input("🔑 Chave API do Apollo", type="password", disabled=not config["buscar_cargo"], help="Cole sua chave gerada em Settings > Integrations > API Keys")
             
             if is_ready and len(df_merged) > 0:
                 st.markdown("#### Identificação de Colunas de Saída")
