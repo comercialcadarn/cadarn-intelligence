@@ -138,7 +138,7 @@ async def fetch_cnpj_async(cnpj: str, session: aiohttp.ClientSession, semaphore:
                 await asyncio.sleep(1)
         return default
 async def fetch_apollo_async(email: str, nome: str, empresa: str, api_key: str, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore) -> dict:
-    """Bate no endpoint do Apollo.io de forma assíncrona e extrai Cargo e LinkedIn."""
+    """Motor Apollo: Concorrência controlada e recuo exponencial contra bloqueios."""
     default = {"email": email, "cargo": "N/D", "linkedin": "N/D"}
     if pd.isna(email) or not str(email).strip() or not api_key: return default
 
@@ -159,7 +159,8 @@ async def fetch_apollo_async(email: str, nome: str, empresa: str, api_key: str, 
     async with semaphore:
         for attempt in range(3):
             try:
-                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                # Timeout ajustado para não ficar preso em conexões mortas
+                async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status == 200:
                         data = await r.json()
                         person = data.get("person", {})
@@ -170,8 +171,9 @@ async def fetch_apollo_async(email: str, nome: str, empresa: str, api_key: str, 
                                 "linkedin": person.get("linkedin_url") or "N/D"
                             }
                         return default
-                    elif r.status == 429: # Rate Limit
-                        await asyncio.sleep(2 ** attempt)
+                    elif r.status == 429: 
+                        # Se bater no limite, recua 2s, depois 4s, depois 8s
+                        await asyncio.sleep(2 ** (attempt + 1))
                         continue
                     elif r.status == 401:
                         default["cargo"] = "Chave API Inválida"
@@ -301,38 +303,45 @@ def executar_pipeline_elite(df_base, col_id, col_nome, col_empresa, col_cnpj, co
             df.drop(columns=['__api_data'], inplace=True)
             stats["empresas_encontradas"] = len(df[df["CNAE da Empresa"] != "N/D"])
 
-# --- INÍCIO DA INTEGRAÇÃO APOLLO ---
+# --- INÍCIO DA INTEGRAÇÃO APOLLO (FLUIDA) ---
         df["Cargo (Apollo)"] = "N/D"
         df["LinkedIn (Apollo)"] = "N/D"
         
         if config.get('buscar_cargo') and config.get('apollo_key') and col_email in df.columns:
-            # Agrupa e remove emails duplicados ou vazios para NÃO GASTAR CRÉDITOS DUAS VEZES
             emails_unicos = df[[col_email, col_nome, col_empresa]].dropna(subset=[col_email]).drop_duplicates(subset=[col_email])
             prog_bar_apollo = st.progress(0)
             
-            async def processar_apollo():
-                # Concorrência mais baixa (5) para não disparar o alarme de segurança do Apollo
-                sem = asyncio.Semaphore(5) 
+            async def processar_apollo_fluido():
+                # Semaphore 8: Seguro para o Apollo, mas agressivo o suficiente para ser rápido
+                sem = asyncio.Semaphore(8) 
                 resultados = {}
-                async with aiohttp.ClientSession() as session:
-                    tarefas = []
-                    for _, row in emails_unicos.iterrows():
-                        tarefas.append(fetch_apollo_async(row[col_email], row[col_nome], row[col_empresa], config['apollo_key'], session, sem))
+                
+                # Desativa a verificação SSL pesada para ganhar milissegundos por requisição
+                connector = aiohttp.TCPConnector(limit=None, ssl=False)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    tarefas = [
+                        fetch_apollo_async(row[col_email], row[col_nome], row[col_empresa], config['apollo_key'], session, sem)
+                        for _, row in emails_unicos.iterrows()
+                    ]
                     
-                    chunk_size = 20
-                    for i in range(0, len(tarefas), chunk_size):
-                        lote = tarefas[i:i+chunk_size]
-                        resps = await asyncio.gather(*lote)
-                        for r in resps: resultados[r['email']] = r
+                    processados = 0
+                    total_tarefas = len(tarefas)
+                    
+                    # as_completed: Assim que UM termina, ele já processa, sem esperar os lerdos
+                    for task in asyncio.as_completed(tarefas):
+                        r = await task
+                        resultados[r['email']] = r
+                        processados += 1
                         
-                        processados = min(i + chunk_size, len(tarefas))
-                        prog = processados / len(tarefas) if len(tarefas) > 0 else 1.0
-                        prog_bar_apollo.progress(prog)
-                        log_ph.markdown(f"👔 **Etapa 4:** Resgatando Cargos e LinkedIn via Apollo ({processados}/{len(tarefas)})...")
+                        # Atualiza a barra de progresso de forma contínua
+                        prog_bar_apollo.progress(processados / total_tarefas)
+                        
+                        if processados % 10 == 0 or processados == total_tarefas:
+                            log_ph.markdown(f"👔 **Etapa 4:** Resgatando Cargos (Apollo) - Em tempo real ({processados}/{total_tarefas})...")
+                            
                 return resultados
 
-            # Reutiliza o loop assíncrono já aberto pela BrasilAPI
-            mapa_apollo = loop.run_until_complete(processar_apollo())
+            mapa_apollo = loop.run_until_complete(processar_apollo_fluido())
             prog_bar_apollo.empty()
             
             df['__apollo_data'] = df[col_email].map(mapa_apollo)
